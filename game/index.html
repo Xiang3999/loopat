@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>弓箭对决 · Archery Duel</title>
+<style>
+  html,body{margin:0;padding:0;background:#1a1f2b;height:100%;display:flex;align-items:center;justify-content:center;}
+  canvas{max-width:100%;max-height:100vh;display:block;box-shadow:0 10px 40px rgba(0,0,0,.5);border-radius:6px;}
+</style>
+</head>
+<body>
+<canvas id="c" width="1200" height="675"></canvas>
+<script>
+'use strict';
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height;
+
+// ---------- 常量 ----------
+const GROUND_Y = 615;           // 地面顶部
+const GRAVITY  = 1500;          // px/s^2
+const MOVE_SPD = 260;
+const JUMP_V   = -640;
+const CHARGE_TIME = 1.1;        // 蓄满秒数
+const ARROW_V_MIN = 380, ARROW_V_MAX = 1400;
+const PLAYER_H = 78;
+
+// 支撑物(可站立;箭会钉在上面)。中间木箱逼你打抛物线
+const PLATFORMS = [
+  {x:200, y:455, w:170, h:14, type:'plat'},
+  {x:830, y:455, w:170, h:14, type:'plat'},
+  {x:565, y:505, w:70,  h:110, type:'crate'},
+];
+
+const KEYMAP = [
+  {left:'KeyA', right:'KeyD', jump:'KeyW', up:'KeyQ', down:'KeyE', fire:'Space'},
+  {left:'ArrowLeft', right:'ArrowRight', jump:'ArrowUp', up:'Comma', down:'Period', fire:'Enter'},
+];
+const HANDLED_CODES = new Set([].concat(...KEYMAP.map(m=>Object.values(m))));
+
+// ---------- 状态 ----------
+let state = 'menu';             // menu | play | over
+let mode  = '2p';               // 2p | ai
+let players = [], arrows = [], sticks = [], particles = [], floats = [];
+let wind = 0, winner = -1, scores = [0,0], shake = 0;
+let keys = {};
+let ai = null;
+
+// ---------- 声音 ----------
+let actx = null;
+function beep(freq, dur, type, vol){
+  try{
+    if(!actx) actx = new (window.AudioContext||window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type||'square'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol||0.08, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime+dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime+dur);
+  }catch(e){}
+}
+
+// ---------- 玩家 ----------
+function newPlayer(i){
+  return {
+    i, x: i===0? 130 : W-130, y: GROUND_Y,
+    vx:0, vy:0, onGround:true,
+    hp:100, aim:45, facing: i===0?1:-1,
+    charge:-1,                  // <0 未蓄力
+    walk:0,
+    name: i===0? '红方' : (mode==='ai'?'电脑':'蓝方'),
+    color: i===0? '#e74c3c' : '#3498db',
+    dark:  i===0? '#a53125' : '#20618c',
+  };
+}
+
+function resetRound(){
+  players = [newPlayer(0), newPlayer(1)];
+  arrows = []; sticks = []; particles = []; floats = [];
+  wind = (Math.random()*2-1)*100;
+  winner = -1; shake = 0;
+  ai = {shootT: 1.4, moveT: 0, moveDir: 0, want: 0};
+  state = 'play';
+}
+
+// ---------- 输入 ----------
+window.addEventListener('keydown', e=>{
+  if(HANDLED_CODES.has(e.code)) e.preventDefault();
+  if(state==='menu'){
+    if(e.code==='Digit1'){ mode='2p'; scores=[0,0]; resetRound(); beep(440,.1); }
+    if(e.code==='Digit2'){ mode='ai'; scores=[0,0]; resetRound(); beep(440,.1); }
+    return;
+  }
+  if(state==='over'){
+    if(e.code==='KeyR'){ resetRound(); }
+    if(e.code==='Escape'){ state='menu'; }
+    return;
+  }
+  if(e.code==='Escape'){ state='menu'; return; }
+  if(e.repeat) return;
+  keys[e.code] = true;
+  players.forEach((p,i)=>{
+    if(mode==='ai' && i===1) return;
+    const m = KEYMAP[i];
+    if(e.code===m.jump && p.onGround && p.hp>0){ p.vy = JUMP_V; p.onGround=false; beep(330,.08,'sine'); }
+    if(e.code===m.fire && p.charge<0 && p.hp>0){ p.charge = 0; }
+  });
+});
+window.addEventListener('keyup', e=>{
+  keys[e.code] = false;
+  if(state!=='play') return;
+  players.forEach((p,i)=>{
+    if(mode==='ai' && i===1) return;
+    if(e.code===KEYMAP[i].fire && p.charge>=0 && p.hp>0) fire(p);
+  });
+});
+
+// ---------- 射击 ----------
+function handPos(p){
+  const a = p.aim*Math.PI/180;
+  return { x: p.x + p.facing*24*Math.cos(a), y: p.y-50 - 24*Math.sin(a) };
+}
+function fire(p){
+  const c = Math.max(p.charge, 0.12);
+  const v = ARROW_V_MIN + c*(ARROW_V_MAX-ARROW_V_MIN);
+  const a = p.aim*Math.PI/180;
+  const h = handPos(p);
+  arrows.push({ x:h.x, y:h.y, vx:p.facing*v*Math.cos(a), vy:-v*Math.sin(a), owner:p.i, charge:c });
+  p.charge = -1;
+  p.vx -= p.facing*40*c; // 小后坐
+  beep(200+c*160, .12, 'sawtooth', .1);
+}
+
+function hurt(p, dmg, ax, ay, fromDir){
+  p.hp = Math.max(0, p.hp - dmg);
+  p.vx += fromDir*140;
+  shake = Math.min(1, shake + 0.5);
+  beep(110,.15,'square',.12);
+  floats.push({x:p.x, y:p.y-PLAYER_H-14, txt:'-'+dmg, t:1});
+  for(let k=0;k<14;k++){
+    particles.push({x:ax, y:ay, vx:(Math.random()*2-1)*260, vy:-Math.random()*260,
+                    life:.5+Math.random()*.3, color:p.color});
+  }
+  if(p.hp<=0){
+    winner = 1-p.i;
+    scores[winner]++;
+    state = 'over';
+    beep(520,.4,'triangle',.1);
+  }
+}
+
+// ---------- AI ----------
+function simMiss(hand, fc, rad, v, target){
+  // 模拟一支箭(含风)飞行,返回轨迹离目标的最近距离
+  let x=hand.x, y=hand.y, vx=fc*v*Math.cos(rad), vy=-v*Math.sin(rad), miss=1e9;
+  for(let t=0; t<2.5; t+=0.02){
+    vy += GRAVITY*0.02; vx += wind*0.02;
+    x += vx*0.02; y += vy*0.02;
+    const d = Math.hypot(x-target.x, y-target.y);
+    if(d<miss) miss=d;
+    if(y>GROUND_Y) break;
+  }
+  return miss;
+}
+function aiSolve(hand, fc, angDeg, target){
+  // 粗扫 + 细化,找出该角度下命中目标所需初速
+  const rad = angDeg*Math.PI/180;
+  let best = {v:-1, miss:1e9};
+  for(let v=ARROW_V_MIN; v<=ARROW_V_MAX; v+=30){
+    const m = simMiss(hand, fc, rad, v, target);
+    if(m<best.miss) best = {v, miss:m};
+  }
+  for(let v=Math.max(ARROW_V_MIN,best.v-28); v<=Math.min(ARROW_V_MAX,best.v+28); v+=6){
+    const m = simMiss(hand, fc, rad, v, target);
+    if(m<best.miss) best = {v, miss:m};
+  }
+  return best;
+}
+function updateAI(dt){
+  const me = players[1], foe = players[0];
+  if(me.hp<=0||foe.hp<=0) return;
+  // 走位
+  if(ai.moveT>0){ ai.moveT-=dt; me.vx = ai.moveDir*MOVE_SPD; }
+  // 躲箭:有来箭接近时随机起跳
+  for(const a of arrows){
+    if(a.owner===0 && Math.abs(a.x-me.x)<260 && Math.sign(a.vx)===Math.sign(me.x-a.x)
+       && me.onGround && Math.random()<0.05){ me.vy=JUMP_V; me.onGround=false; }
+  }
+  // 射击节奏
+  if(me.charge<0){
+    ai.shootT -= dt;
+    if(ai.shootT<=0){
+      const fc = foe.x >= me.x ? 1 : -1;
+      const target = {x:foe.x, y:foe.y-40};
+      // 尝试几个角度,选轨迹误差最小的
+      let plan = null;
+      for(let k=0;k<3;k++){
+        const ang = 34 + Math.random()*32;
+        const rad = ang*Math.PI/180;
+        const hp = { x: me.x + fc*24*Math.cos(rad), y: me.y-50 - 24*Math.sin(rad) };
+        const s = aiSolve(hp, fc, ang, target);
+        if(s.v>0 && (!plan || s.miss<plan.miss)) plan = {ang, v:s.v, miss:s.miss};
+      }
+      window.__lastPlan = plan ? {ang:plan.ang, v:plan.v, miss:plan.miss} : 'none';
+      if(plan && plan.miss<80){
+        const v = plan.v * (1 + (Math.random()*2-1)*0.025);  // 手抖
+        me.aim = plan.ang;
+        ai.want = Math.min(1, Math.max(0.15, (v-ARROW_V_MIN)/(ARROW_V_MAX-ARROW_V_MIN)));
+        me.charge = 0;
+      }else ai.shootT = 0.4;                                  // 打不到,换位再试
+    }
+  }else{
+    me.charge += dt/CHARGE_TIME;
+    if(me.charge>=ai.want){
+      fire(me);
+      ai.shootT = 1.5 + Math.random()*1.3;
+      // 保持中距离:太近拉开,太远靠近,适中随机
+      const d = Math.abs(foe.x - me.x), toFoe = Math.sign(foe.x - me.x)||1;
+      ai.moveDir = d<380? -toFoe : d>880? toFoe : (Math.random()<0.5?-1:1);
+      ai.moveT = 0.3 + Math.random()*0.55;
+    }
+  }
+}
+
+// ---------- 更新 ----------
+function supportsAt(px){
+  const list = [{top:GROUND_Y, x0:-1e9, x1:1e9}];
+  for(const pl of PLATFORMS) list.push({top:pl.y, x0:pl.x-12, x1:pl.x+pl.w+12});
+  return list;
+}
+function updatePlayer(p, dt){
+  const m = KEYMAP[p.i];
+  const isHuman = !(mode==='ai' && p.i===1);
+  if(p.hp>0 && isHuman){
+    let dir = 0;
+    if(keys[m.left]) dir -= 1;
+    if(keys[m.right]) dir += 1;
+    p.vx = p.vx*0.7 + dir*MOVE_SPD*0.3 + (dir===0? p.vx*0 : 0);
+    if(dir===0) p.vx *= 0.75;
+    if(keys[m.up])   p.aim = Math.min(85, p.aim + 90*dt);
+    if(keys[m.down]) p.aim = Math.max(-15, p.aim - 90*dt);
+    if(p.charge>=0) p.charge = Math.min(1, p.charge + dt/CHARGE_TIME);
+  }else if(p.hp>0){
+    if(p.charge>=0){} // AI 蓄力在 updateAI 里推进
+    p.vx *= 0.85;
+  }else{
+    p.vx *= 0.9;
+  }
+  // 朝向对手
+  const foe = players[1-p.i];
+  p.facing = foe.x >= p.x ? 1 : -1;
+
+  const prevY = p.y;
+  p.vy += GRAVITY*dt;
+  p.y += p.vy*dt;
+  p.x += p.vx*dt;
+  p.x = Math.max(24, Math.min(W-24, p.x));
+  p.onGround = false;
+  if(p.vy>=0){
+    for(const s of supportsAt(p.x)){
+      if(p.x>=s.x0 && p.x<=s.x1 && prevY<=s.top+1 && p.y>=s.top){
+        p.y = s.top; p.vy = 0; p.onGround = true; break;
+      }
+    }
+  }
+  if(Math.abs(p.vx)>20 && p.onGround) p.walk += dt*10; else p.walk = 0;
+}
+
+function pointHitsPlayer(p, x, y){
+  // 返回 0 未中 / 1 身体 / 2 爆头
+  const hx = p.x, hy = p.y-PLAYER_H+11;
+  if((x-hx)*(x-hx)+(y-hy)*(y-hy) < 13*13) return 2;
+  if(Math.abs(x-p.x)<12 && y>p.y-60 && y<p.y) return 1;
+  return 0;
+}
+
+function update(dt){
+  if(state!=='play') { shake = Math.max(0, shake-dt*2); return; }
+  if(mode==='ai') updateAI(dt);
+  players.forEach(p=>updatePlayer(p, dt));
+
+  for(let i=arrows.length-1;i>=0;i--){
+    const a = arrows[i];
+    // 分步积分:高速箭每步最多移动 6px,避免穿过人物(隧穿)
+    const steps = Math.max(1, Math.ceil(Math.hypot(a.vx,a.vy)*dt/6));
+    const sdt = dt/steps;
+    let removed = false;
+    for(let s=0;s<steps && !removed;s++){
+      a.vy += GRAVITY*sdt;
+      a.vx += wind*sdt;
+      a.x += a.vx*sdt; a.y += a.vy*sdt;
+      // 中人
+      for(const p of players){
+        if(p.i===a.owner || p.hp<=0) continue;
+        const part = pointHitsPlayer(p, a.x, a.y);
+        if(part){
+          let dmg = Math.round(12 + a.charge*18);
+          if(part===2){ dmg = Math.round(dmg*1.6); floats.push({x:p.x,y:p.y-PLAYER_H-34,txt:'爆头!',t:1.2}); }
+          hurt(p, dmg, a.x, a.y, Math.sign(a.vx)||1);
+          removed = true; break;
+        }
+      }
+      if(removed) break;
+      // 钉墙/钉地
+      let stuck = a.y>=GROUND_Y+4;
+      if(!stuck) for(const pl of PLATFORMS){
+        if(a.x>pl.x && a.x<pl.x+pl.w && a.y>pl.y && a.y<pl.y+pl.h+ (pl.type==='crate'?0:6)){ stuck=true; break; }
+      }
+      if(stuck){
+        sticks.push({x:a.x, y:Math.min(a.y, GROUND_Y+6), ang:Math.atan2(a.vy,a.vx), t:8});
+        beep(90,.06,'square',.05); removed = true; break;
+      }
+      if(a.x<-60||a.x>W+60||a.y>H+60){ removed = true; break; }
+    }
+    if(removed) arrows.splice(i,1);
+  }
+
+  for(let i=particles.length-1;i>=0;i--){
+    const q = particles[i];
+    q.vy += GRAVITY*0.6*dt; q.x += q.vx*dt; q.y += q.vy*dt; q.life -= dt;
+    if(q.life<=0) particles.splice(i,1);
+  }
+  for(let i=floats.length-1;i>=0;i--){ floats[i].y -= 40*dt; floats[i].t -= dt; if(floats[i].t<=0) floats.splice(i,1); }
+  for(let i=sticks.length-1;i>=0;i--){ sticks[i].t -= dt; if(sticks[i].t<=0) sticks.splice(i,1); }
+  shake = Math.max(0, shake - dt*2.4);
+}
+
+// ---------- 绘制 ----------
+function drawBackground(){
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#7ec8f2'); g.addColorStop(.7,'#cfeaf7'); g.addColorStop(1,'#e8f6dd');
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  // 云
+  ctx.fillStyle = 'rgba(255,255,255,.85)';
+  [[180,95,46],[420,60,30],[900,120,52],[1060,70,34],[640,85,26]].forEach(([x,y,r])=>{
+    ctx.beginPath();
+    ctx.arc(x,y,r,0,7); ctx.arc(x+r*.9,y+6,r*.7,0,7); ctx.arc(x-r*.9,y+8,r*.65,0,7);
+    ctx.fill();
+  });
+  // 远山
+  ctx.fillStyle = '#b5d9a8';
+  ctx.beginPath(); ctx.moveTo(0,GROUND_Y);
+  ctx.quadraticCurveTo(220,430,480,GROUND_Y); ctx.quadraticCurveTo(760,410,1200,GROUND_Y);
+  ctx.fill();
+  // 地面
+  ctx.fillStyle = '#7cb95c'; ctx.fillRect(0,GROUND_Y,W,8);
+  ctx.fillStyle = '#8a6b48'; ctx.fillRect(0,GROUND_Y+8,W,H-GROUND_Y-8);
+  ctx.fillStyle = 'rgba(0,0,0,.08)';
+  for(let x=14;x<W;x+=42) ctx.fillRect(x, GROUND_Y+18+(x*7%22), 16, 5);
+  // 平台与木箱
+  for(const pl of PLATFORMS){
+    if(pl.type==='crate'){
+      ctx.fillStyle='#b98a4e'; ctx.fillRect(pl.x,pl.y,pl.w,pl.h);
+      ctx.strokeStyle='#7d5a2e'; ctx.lineWidth=3;
+      ctx.strokeRect(pl.x+1.5,pl.y+1.5,pl.w-3,pl.h-3);
+      ctx.beginPath(); ctx.moveTo(pl.x,pl.y); ctx.lineTo(pl.x+pl.w,pl.y+pl.h);
+      ctx.moveTo(pl.x+pl.w,pl.y); ctx.lineTo(pl.x,pl.y+pl.h); ctx.stroke();
+    }else{
+      ctx.fillStyle='#9c7a4c'; ctx.fillRect(pl.x,pl.y,pl.w,pl.h);
+      ctx.fillStyle='#7cb95c'; ctx.fillRect(pl.x,pl.y,pl.w,5);
+      ctx.fillStyle='rgba(0,0,0,.15)';
+      ctx.fillRect(pl.x+14,pl.y+pl.h,10,26); ctx.fillRect(pl.x+pl.w-24,pl.y+pl.h,10,26);
+    }
+  }
+}
+
+function drawStickman(p){
+  const a = p.aim*Math.PI/180;
+  const hx = p.x, hy = p.y - PLAYER_H + 11;     // 头心
+  ctx.save();
+  if(p.hp<=0){ ctx.translate(p.x, p.y); ctx.rotate(p.facing*Math.PI/2*0.9); ctx.translate(-p.x,-p.y+8); }
+  ctx.lineCap='round';
+  ctx.strokeStyle = p.dark; ctx.fillStyle = p.color; ctx.lineWidth = 5;
+  // 腿
+  const sw = p.onGround && Math.abs(p.vx)>20 ? Math.sin(p.walk)*9 : 5;
+  ctx.beginPath();
+  ctx.moveTo(p.x, p.y-26); ctx.lineTo(p.x - 8 - sw, p.y);
+  ctx.moveTo(p.x, p.y-26); ctx.lineTo(p.x + 8 + sw, p.y);
+  ctx.stroke();
+  // 身体
+  ctx.strokeStyle = p.color;
+  ctx.beginPath(); ctx.moveTo(hx, hy+12); ctx.lineTo(p.x, p.y-26); ctx.stroke();
+  // 头
+  ctx.beginPath(); ctx.arc(hx, hy, 11, 0, 7); ctx.fill();
+  ctx.strokeStyle=p.dark; ctx.lineWidth=2.5; ctx.stroke();
+  // 头带
+  ctx.strokeStyle='#fff'; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.moveTo(hx-10, hy-3); ctx.lineTo(hx+10, hy-3); ctx.stroke();
+  // 持弓臂 + 弓
+  const hnd = handPos(p);
+  ctx.strokeStyle = p.color; ctx.lineWidth=5;
+  ctx.beginPath(); ctx.moveTo(p.x, p.y-50); ctx.lineTo(hnd.x, hnd.y); ctx.stroke();
+  const bowA = p.facing>0 ? -a : Math.PI + a;
+  ctx.strokeStyle = '#6b4a26'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.arc(hnd.x, hnd.y, 17, bowA - Math.PI/2.4, bowA + Math.PI/2.4); ctx.stroke();
+  // 弓弦 + 搭箭
+  const tipX = Math.cos(bowA), tipY = Math.sin(bowA);
+  const e1x = hnd.x + 17*Math.cos(bowA-Math.PI/2.4), e1y = hnd.y + 17*Math.sin(bowA-Math.PI/2.4);
+  const e2x = hnd.x + 17*Math.cos(bowA+Math.PI/2.4), e2y = hnd.y + 17*Math.sin(bowA+Math.PI/2.4);
+  const pull = p.charge>=0 ? 6+p.charge*12 : 0;
+  const nx = hnd.x - tipX*pull, ny = hnd.y - tipY*pull;
+  ctx.strokeStyle='#e8e0cc'; ctx.lineWidth=1.6;
+  ctx.beginPath(); ctx.moveTo(e1x,e1y); ctx.lineTo(nx,ny); ctx.lineTo(e2x,e2y); ctx.stroke();
+  if(p.charge>=0){
+    ctx.strokeStyle='#5d4324'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.moveTo(nx,ny); ctx.lineTo(nx+tipX*30, ny+tipY*30); ctx.stroke();
+  }
+  ctx.restore();
+
+  if(p.hp<=0) return;
+  // 蓄力条
+  if(p.charge>=0){
+    const bx = p.x-22, by = p.y-PLAYER_H-26;
+    ctx.fillStyle='rgba(0,0,0,.35)'; ctx.fillRect(bx,by,44,7);
+    ctx.fillStyle = p.charge<.55?'#5fd35f':(p.charge<.85?'#f2b035':'#e74c3c');
+    ctx.fillRect(bx+1,by+1,42*Math.min(1,p.charge),5);
+    // 弹道预览
+    const c = Math.max(p.charge,.12);
+    const v = ARROW_V_MIN + c*(ARROW_V_MAX-ARROW_V_MIN);
+    let px2 = handPos(p).x, py2 = handPos(p).y;
+    let vx2 = p.facing*v*Math.cos(a), vy2 = -v*Math.sin(a);
+    ctx.fillStyle = 'rgba(40,40,40,.35)';
+    for(let s2=0;s2<9;s2++){
+      vy2 += GRAVITY*0.045; vx2 += wind*0.045;
+      px2 += vx2*0.045; py2 += vy2*0.045;
+      ctx.beginPath(); ctx.arc(px2,py2, 3-s2*0.22, 0, 7); ctx.fill();
+    }
+  }
+  // 角度小字
+  ctx.fillStyle='rgba(0,0,0,.45)'; ctx.font='11px sans-serif'; ctx.textAlign='center';
+  ctx.fillText(Math.round(p.aim)+'°', p.x, p.y-PLAYER_H-32);
+}
+
+function drawArrow(x,y,ang){
+  ctx.save(); ctx.translate(x,y); ctx.rotate(ang);
+  ctx.strokeStyle='#5d4324'; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.moveTo(-24,0); ctx.lineTo(0,0); ctx.stroke();
+  ctx.fillStyle='#444';
+  ctx.beginPath(); ctx.moveTo(2,0); ctx.lineTo(-6,-4); ctx.lineTo(-6,4); ctx.fill();
+  ctx.strokeStyle='#ddd'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(-24,0); ctx.lineTo(-29,-4); ctx.moveTo(-24,0); ctx.lineTo(-29,4); ctx.stroke();
+  ctx.restore();
+}
+
+function drawHUD(){
+  players.forEach((p,i)=>{
+    const x = i===0? 24 : W-24-260, right = i===1;
+    ctx.fillStyle='rgba(0,0,0,.35)'; ctx.fillRect(x,20,260,46);
+    ctx.fillStyle=p.color; ctx.font='bold 16px sans-serif';
+    ctx.textAlign = right? 'right':'left';
+    ctx.fillText(p.name + '  ' + '●'.repeat(scores[i]) , right? x+248 : x+12, 40);
+    ctx.fillStyle='rgba(255,255,255,.25)'; ctx.fillRect(x+12,48,236,10);
+    ctx.fillStyle = p.hp>35? p.color : '#ff5544';
+    const w2 = 236*p.hp/100;
+    ctx.fillRect(right? x+12+236-w2 : x+12, 48, w2, 10);
+  });
+  // 风
+  const mag = Math.abs(wind);
+  const n = mag<25? 0 : mag<60? 1 : mag<90? 2 : 3;
+  ctx.fillStyle='rgba(0,0,0,.35)'; ctx.fillRect(W/2-70,20,140,30);
+  ctx.fillStyle='#fff'; ctx.font='14px sans-serif'; ctx.textAlign='center';
+  const arr = n===0? '·' : (wind>0?'→':'←').repeat(n);
+  ctx.fillText('风  ' + arr, W/2, 40);
+  // 操作提示
+  ctx.fillStyle='rgba(0,0,0,.30)'; ctx.font='12px sans-serif';
+  ctx.textAlign='left';  ctx.fillText('A/D移动 W跳 Q/E角度 空格蓄力射', 24, H-12);
+  if(mode==='2p'){ ctx.textAlign='right'; ctx.fillText('←/→移动 ↑跳 ,/.角度 回车蓄力射', W-24, H-12); }
+}
+
+function drawMenu(){
+  drawBackground();
+  ctx.fillStyle='rgba(20,26,40,.55)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  ctx.fillStyle='#fff'; ctx.font='bold 64px sans-serif';
+  ctx.fillText('弓箭对决', W/2, 180);
+  ctx.font='20px sans-serif'; ctx.fillStyle='rgba(255,255,255,.75)';
+  ctx.fillText('ARCHERY DUEL · 2D 射箭对战', W/2, 220);
+
+  const opts = [['1','双人同屏'],['2','人机对战']];
+  opts.forEach(([k,t],i)=>{
+    const y = 300+i*80;
+    ctx.fillStyle='rgba(255,255,255,.12)'; ctx.fillRect(W/2-180, y-38, 360, 58);
+    ctx.strokeStyle='rgba(255,255,255,.5)'; ctx.lineWidth=2; ctx.strokeRect(W/2-180,y-38,360,58);
+    ctx.fillStyle='#ffd75e'; ctx.font='bold 26px sans-serif';
+    ctx.fillText('按 '+k, W/2-100, y);
+    ctx.fillStyle='#fff'; ctx.fillText(t, W/2+50, y);
+  });
+
+  ctx.font='15px sans-serif'; ctx.fillStyle='rgba(255,255,255,.8)';
+  ctx.fillText('红方:A/D 移动 · W 跳跃 · Q/E 调角度 · 按住空格蓄力、松开发射', W/2, 510);
+  ctx.fillText('蓝方:←/→ 移动 · ↑ 跳跃 · ,/. 调角度 · 按住回车蓄力、松开发射', W/2, 540);
+  ctx.fillStyle='rgba(255,255,255,.5)';
+  ctx.fillText('注意风向 · 爆头 1.6 倍伤害 · Esc 回菜单', W/2, 580);
+}
+
+function draw(){
+  if(state==='menu'){ drawMenu(); return; }
+  ctx.save();
+  if(shake>0) ctx.translate((Math.random()*2-1)*shake*7,(Math.random()*2-1)*shake*7);
+  drawBackground();
+  sticks.forEach(s=>{ ctx.globalAlpha = Math.min(1, s.t); drawArrow(s.x,s.y,s.ang); ctx.globalAlpha=1; });
+  players.forEach(drawStickman);
+  arrows.forEach(a=>drawArrow(a.x,a.y,Math.atan2(a.vy,a.vx)));
+  particles.forEach(q=>{ ctx.globalAlpha=Math.max(0,q.life*2); ctx.fillStyle=q.color;
+    ctx.fillRect(q.x-2,q.y-2,4,4); ctx.globalAlpha=1; });
+  floats.forEach(f=>{ ctx.globalAlpha=Math.max(0,Math.min(1,f.t)); ctx.fillStyle='#c0392b';
+    ctx.font='bold 18px sans-serif'; ctx.textAlign='center'; ctx.fillText(f.txt,f.x,f.y); ctx.globalAlpha=1; });
+  drawHUD();
+  ctx.restore();
+
+  if(state==='over'){
+    ctx.fillStyle='rgba(20,26,40,.6)'; ctx.fillRect(0,0,W,H);
+    const wp = players[winner];
+    ctx.textAlign='center';
+    ctx.fillStyle=wp.color; ctx.font='bold 56px sans-serif';
+    ctx.fillText(wp.name+' 获胜!', W/2, H/2-40);
+    ctx.fillStyle='#fff'; ctx.font='24px sans-serif';
+    ctx.fillText(scores[0]+'  :  '+scores[1], W/2, H/2+10);
+    ctx.font='18px sans-serif'; ctx.fillStyle='rgba(255,255,255,.85)';
+    ctx.fillText('按 R 再来一局 · 按 Esc 回菜单', W/2, H/2+60);
+  }
+}
+
+// 供自动化测试读取状态
+window.__dbg = () => ({ state, hp: players.map(p=>p.hp), arrows: arrows.length, scores: [...scores],
+  p2: players[1] && {charge:players[1].charge, aim:Math.round(players[1].aim), x:Math.round(players[1].x)},
+  ai: ai && {want:ai.want, shootT:+ai.shootT.toFixed(2)}, lastPlan: window.__lastPlan });
+
+// ---------- 主循环 ----------
+let last = performance.now();
+function loop(now){
+  const dt = Math.min(0.033, (now-last)/1000);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
