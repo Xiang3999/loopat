@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Dawn Ocean POC</title>
+<style>html,body{margin:0;overflow:hidden;background:#000}</style>
+<script type="importmap">
+{ "imports": {
+    "three": "./node_modules/three/build/three.module.js",
+    "three/addons/": "./node_modules/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { Water } from 'three/addons/objects/Water.js';
+import { Sky } from 'three/addons/objects/Sky.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.55;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, innerWidth/innerHeight, 0.5, 20000);
+camera.position.set(0, 4.5, 0);
+
+// ---------- 程序化水面法线贴图(替代官方 waternormals.jpg) ----------
+function makeWaterNormals(size = 512) {
+  // 多方向正弦波叠加出高度场,再差分求法线
+  const waves = [];
+  let seed = 42;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  for (let i = 0; i < 24; i++) {
+    const a = rnd() * Math.PI * 2;
+    const freq = (2 + rnd() * 30) * Math.PI * 2 / size;
+    waves.push({ dx: Math.cos(a), dy: Math.sin(a), freq, amp: 1 / (1 + i * 0.4), ph: rnd() * Math.PI * 2 });
+  }
+  const h = (x, y) => {
+    let v = 0;
+    for (const w of waves) v += Math.sin((x * w.dx + y * w.dy) * w.freq + w.ph) * w.amp;
+    return v;
+  };
+  const img = new ImageData(size, size);
+  const S = 1.1; // 法线强度
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    // 用取模保证四方连续
+    const dhx = h((x+1)%size, y) - h((x-1+size)%size, y);
+    const dhy = h(x, (y+1)%size) - h(x, (y-1+size)%size);
+    const n = new THREE.Vector3(-dhx*S, -dhy*S, 1).normalize();
+    const o = (y*size + x) * 4;
+    img.data[o]   = (n.x*0.5+0.5)*255;
+    img.data[o+1] = (n.y*0.5+0.5)*255;
+    img.data[o+2] = (n.z*0.5+0.5)*255;
+    img.data[o+3] = 255;
+  }
+  const cv = document.createElement('canvas'); cv.width = cv.height = size;
+  cv.getContext('2d').putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+
+// ---------- 天空(日出) ----------
+const sky = new Sky();
+sky.scale.setScalar(10000);
+scene.add(sky);
+const su = sky.material.uniforms;
+su.turbidity.value = 4.5;
+su.rayleigh.value = 2.5;
+su.mieCoefficient.value = 0.0028;
+su.mieDirectionalG.value = 0.85;
+const elevation = 3.2, azimuth = 180;          // 太阳刚离海平面
+const phi = THREE.MathUtils.degToRad(90 - elevation);
+const theta = THREE.MathUtils.degToRad(azimuth);
+const sunDir = new THREE.Vector3().setFromSphericalCoords(1, phi, theta);
+su.sunPosition.value.copy(sunDir);
+
+// ---------- 海面 ----------
+const water = new Water(new THREE.PlaneGeometry(10000, 10000), {
+  textureWidth: 512, textureHeight: 512,
+  waterNormals: makeWaterNormals(),
+  sunDirection: sunDir.clone(),
+  sunColor: 0xffb36b,
+  waterColor: 0x02141f,
+  distortionScale: 1.8,
+  fog: false,
+});
+water.rotation.x = -Math.PI / 2;
+water.material.uniforms.time.value = 6.0;
+water.material.uniforms.size.value = 6.0;
+scene.add(water);
+
+// ---------- 巴厘岛 jukung 小船(带舷外浮架的剪影) ----------
+function makeJukung() {
+  const g = new THREE.Group();
+  const dark = new THREE.MeshStandardMaterial({ color: 0x0d0f12, roughness: 0.9 });
+  const hull = new THREE.Mesh(new THREE.CapsuleGeometry(0.45, 4.2, 4, 8), dark);
+  hull.rotation.z = Math.PI / 2; hull.scale.y = 0.62;
+  g.add(hull);
+  for (const side of [-1, 1]) {                 // 浮架
+    const fl = new THREE.Mesh(new THREE.CapsuleGeometry(0.14, 3.4, 3, 6), dark);
+    fl.rotation.z = Math.PI / 2;
+    fl.position.set(0, -0.05, side * 2.1);
+    g.add(fl);
+    for (const bx of [-1.2, 1.2]) {             // 连接杆
+      const rod = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 2.3), dark);
+      rod.rotation.x = Math.PI / 2;
+      rod.position.set(bx, 0.28, side * 1.05);
+      rod.rotation.z = side * 0.18;
+      g.add(rod);
+    }
+  }
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.07, 3.4), dark);
+  mast.position.set(-0.6, 1.8, 0);
+  g.add(mast);
+  // 船上两个人
+  for (const px of [0.7, 1.6]) {
+    const man = new THREE.Mesh(new THREE.CapsuleGeometry(0.16, 0.5, 3, 6), dark);
+    man.position.set(px, 0.75, 0);
+    g.add(man);
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.14, 8, 8), dark);
+    head.position.set(px, 1.25, 0);
+    g.add(head);
+  }
+  return g;
+}
+const positions = [ [-26, 95, 0.5], [14, 70, -0.4], [40, 130, 0.2], [-6, 55, 0.05] ];
+for (const [x, z, ry] of positions) {
+  const b = makeJukung();
+  b.position.set(x, 0.35, -z);
+  b.rotation.y = ry;
+  scene.add(b);
+}
+
+// ---------- 跃出水面的海豚(弯曲圆环段近似) ----------
+const dolphinMat = new THREE.MeshStandardMaterial({ color: 0x11181e, roughness: 0.35, metalness: 0.1 });
+const dolphin = new THREE.Mesh(new THREE.TorusGeometry(1.6, 0.28, 10, 24, Math.PI * 0.85), dolphinMat);
+dolphin.position.set(-10, -0.3, -45);
+dolphin.rotation.z = Math.PI * 0.14;
+dolphin.scale.set(1, 1, 0.55);
+scene.add(dolphin);
+
+// ---------- 光 ----------
+const sun = new THREE.DirectionalLight(0xffa050, 2.2);
+sun.position.copy(sunDir).multiplyScalar(100);
+scene.add(sun);
+scene.add(new THREE.AmbientLight(0x39506b, 0.9));
+
+camera.lookAt(0, 3.0, -100);
+
+renderer.render(scene, camera);
+window.__ready = true;
+</script>
+</body>
+</html>
