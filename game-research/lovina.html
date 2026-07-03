@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Lovina Dolphin Dawn</title>
+<style>html,body{margin:0;overflow:hidden;background:#000}</style>
+<script type="importmap">
+{ "imports": {
+    "three": "./node_modules/three/build/three.module.js",
+    "three/addons/": "./node_modules/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { Water } from 'three/addons/objects/Water.js';
+import { Sky } from 'three/addons/objects/Sky.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.58;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0xc9ab8a, 500, 6000);   // 清晨薄雾
+const camera = new THREE.PerspectiveCamera(58, innerWidth/innerHeight, 0.1, 20000);
+camera.position.set(0, 1.75, 0);                   // 坐在船上的视线高度
+
+// ---------- 程序化水面法线 ----------
+function makeWaterNormals(size = 512) {
+  const waves = [];
+  let seed = 42;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  for (let i = 0; i < 24; i++) {
+    const a = rnd() * Math.PI * 2;
+    const freq = (2 + rnd() * 30) * Math.PI * 2 / size;
+    waves.push({ dx: Math.cos(a), dy: Math.sin(a), freq, amp: 1 / (1 + i * 0.4), ph: rnd() * Math.PI * 2 });
+  }
+  const h = (x, y) => { let v = 0; for (const w of waves) v += Math.sin((x*w.dx + y*w.dy)*w.freq + w.ph)*w.amp; return v; };
+  const img = new ImageData(size, size);
+  const S = 0.85;
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const dhx = h((x+1)%size, y) - h((x-1+size)%size, y);
+    const dhy = h(x, (y+1)%size) - h(x, (y-1+size)%size);
+    const n = new THREE.Vector3(-dhx*S, -dhy*S, 1).normalize();
+    const o = (y*size + x) * 4;
+    img.data[o] = (n.x*0.5+0.5)*255; img.data[o+1] = (n.y*0.5+0.5)*255;
+    img.data[o+2] = (n.z*0.5+0.5)*255; img.data[o+3] = 255;
+  }
+  const cv = document.createElement('canvas'); cv.width = cv.height = size;
+  cv.getContext('2d').putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+
+// ---------- 日出天空 ----------
+const sky = new Sky();
+sky.scale.setScalar(10000);
+scene.add(sky);
+const su = sky.material.uniforms;
+su.turbidity.value = 5.5;
+su.rayleigh.value = 3.0;
+su.mieCoefficient.value = 0.0032;
+su.mieDirectionalG.value = 0.88;
+const elevation = 5.0, azimuth = 180;
+const phi = THREE.MathUtils.degToRad(90 - elevation);
+const theta = THREE.MathUtils.degToRad(azimuth);
+const sunDir = new THREE.Vector3().setFromSphericalCoords(1, phi, theta);
+su.sunPosition.value.copy(sunDir);
+
+// ---------- 海面 ----------
+const water = new Water(new THREE.PlaneGeometry(12000, 12000), {
+  textureWidth: 512, textureHeight: 512,
+  waterNormals: makeWaterNormals(),
+  sunDirection: sunDir.clone(),
+  sunColor: 0xffa860,
+  waterColor: 0x03161f,
+  distortionScale: 1.25,
+  fog: true,
+});
+water.rotation.x = -Math.PI / 2;
+water.material.uniforms.time.value = 7.3;
+water.material.uniforms.size.value = 11.0;
+scene.add(water);
+
+// ---------- 光 ----------
+const sunLight = new THREE.DirectionalLight(0xffa050, 2.4);
+sunLight.position.copy(sunDir).multiplyScalar(120);
+scene.add(sunLight);
+scene.add(new THREE.AmbientLight(0x4a5a75, 1.0));
+const bounce = new THREE.HemisphereLight(0xdd9955, 0x0a1a28, 0.7); // 天空暖光 + 海面冷光
+scene.add(bounce);
+
+// ---------- 程序化海豚(飞旋海豚,身体沿圆弧弯曲) ----------
+function dolphinBody(L = 1.9, R = 1.6) {
+  // 半径轮廓:吻突细长 -> 额隆 -> 躯干最粗 -> 尾柄收细
+  const prof = t => {
+    if (t < 0.07) return 0.016 + t/0.07*0.032;
+    if (t < 0.17) return 0.048 + (t-0.07)/0.10*0.055;
+    if (t < 0.48) return 0.103 + Math.sin((t-0.17)/0.31*Math.PI/2)*0.052;
+    return Math.max(0.014, 0.155*Math.pow(1-(t-0.48)/0.52, 0.92));
+  };
+  const N = 48, M = 14;
+  const pos = [], idx = [];
+  const spine = t => {                    // 沿圆弧的脊柱(s=0 在吻端)
+    const s = t*L, a = s/R;
+    return { x: R*Math.sin(a), y: R*Math.cos(a)-R, tan: -a };
+  };
+  for (let i = 0; i <= N; i++) {
+    const t = i/N, r = prof(t), sp = spine(t);
+    const ca = Math.cos(sp.tan), sa = Math.sin(sp.tan);
+    for (let j = 0; j <= M; j++) {
+      const th = j/M*Math.PI*2;
+      const ry = r*1.06*Math.cos(th), rz = r*0.88*Math.sin(th);
+      // 法向(垂直于切线,在 XY 面内)= (-sa? ) 切线角为 sp.tan
+      pos.push(sp.x - Math.sin(sp.tan)*ry, sp.y + Math.cos(sp.tan)*ry, rz);
+    }
+  }
+  for (let i = 0; i < N; i++) for (let j = 0; j < M; j++) {
+    const a = i*(M+1)+j, b = a+M+1;
+    idx.push(a, b, a+1, b, b+1, a+1);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return { geo: g, spine, prof, L, R };
+}
+function finShape(len, ht, sweep) {       // 后掠鳍形
+  const s = new THREE.Shape();
+  s.moveTo(0, 0);
+  s.quadraticCurveTo(sweep*0.15, ht*0.9, sweep, ht);
+  s.quadraticCurveTo(sweep*0.75, ht*0.35, len, 0);
+  s.closePath();
+  return s;
+}
+function makeDolphin({ arc = 0.55 } = {}) {
+  const mat = new THREE.MeshStandardMaterial({ color: 0x39424d, roughness: 0.28, metalness: 0.05 });
+  const g = new THREE.Group();
+  const { geo, spine, prof, L, R } = dolphinBody();
+  g.add(new THREE.Mesh(geo, mat));
+  const place = (mesh, t, outward) => {   // 把鳍放到脊柱 t 处
+    const sp = spine(t);
+    mesh.position.set(sp.x - Math.sin(sp.tan)*outward, sp.y + Math.cos(sp.tan)*outward, 0);
+    mesh.rotation.z = sp.tan;
+  };
+  // 背鳍
+  const dorsal = new THREE.Mesh(new THREE.ExtrudeGeometry(finShape(0.30, 0.22, -0.16), { depth: 0.022, bevelEnabled: false }), mat);
+  dorsal.geometry.translate(-0.13, 0, -0.011);
+  place(dorsal, 0.44, prof(0.44)*0.92);
+  g.add(dorsal);
+  // 尾鳍(水平)
+  const fl = new THREE.Mesh(new THREE.ExtrudeGeometry(finShape(0.24, 0.30, -0.13), { depth: 0.016, bevelEnabled: false }), mat);
+  fl.geometry.translate(-0.05, 0, -0.008);
+  const fr = fl.clone();
+  fl.rotation.x = Math.PI/2;  fr.rotation.x = -Math.PI/2;
+  const tail = spine(0.995);
+  for (const f of [fl, fr]) {
+    f.position.set(tail.x - Math.sin(tail.tan)*0.0, tail.y, 0);
+    f.rotation.z = tail.tan - 0.35;
+    g.add(f);
+  }
+  // 胸鳍一对
+  for (const sgn of [1, -1]) {
+    const p = new THREE.Mesh(new THREE.ExtrudeGeometry(finShape(0.20, 0.16, -0.10), { depth: 0.015, bevelEnabled: false }), mat);
+    p.geometry.translate(-0.04, 0, -0.0075);
+    const sp = spine(0.27);
+    p.position.set(sp.x - Math.sin(sp.tan)*(-prof(0.27)*0.35), sp.y + Math.cos(sp.tan)*(-prof(0.27)*0.35), sgn*prof(0.27)*0.7);
+    p.rotation.z = sp.tan + Math.PI + 0.5;       // 指向斜后下
+    p.rotation.x = sgn*0.9;
+    g.add(p);
+  }
+  // 让弧线对称(∩ 形):整体绕 Z 转半个弧角
+  const total = L/R;
+  const wrap = new THREE.Group();
+  g.rotation.z = total/2;
+  wrap.add(g);
+  return wrap;
+}
+
+// ---------- 水花 ----------
+function splashTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const x = c.getContext('2d');
+  const grd = x.createRadialGradient(64,64,4, 64,64,60);
+  grd.addColorStop(0, 'rgba(255,250,240,0.95)');
+  grd.addColorStop(0.35, 'rgba(255,240,220,0.5)');
+  grd.addColorStop(1, 'rgba(255,240,220,0)');
+  x.fillStyle = grd; x.fillRect(0,0,128,128);
+  return new THREE.CanvasTexture(c);
+}
+const splashTex = splashTexture();
+function addSplash(x, z, s = 1, o = 0.55) {
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: splashTex, transparent: true, opacity: o,
+    depthWrite: false, blending: THREE.AdditiveBlending }));
+  sp.position.set(x, 0.25*s, z);
+  sp.scale.set(2.2*s, 1.1*s, 1);
+  scene.add(sp);
+}
+
+// ---------- 海豚群摆位 ----------
+function poseDolphin(x, z, { y = 0, yaw = 0, pitch = 0, scale = 1 } = {}) {
+  const d = makeDolphin();
+  d.position.set(x, y, z);
+  d.rotation.y = yaw;
+  d.rotation.x = pitch;
+  d.scale.setScalar(scale);
+  scene.add(d);
+  return d;
+}
+// 主角:完整跃出水面,离船很近(在阳光反光带里,拍照黄金位)
+poseDolphin(-2.5, -13, { y: 0.85, yaw: -0.55, scale: 1.25 });
+addSplash(-3.8, -12.4, 1.5, 0.75); addSplash(-1.2, -13.4, 1.1, 0.55);
+// 出水换气中(只露背弧)
+poseDolphin(2.5, -10.5, { y: -0.28, yaw: 0.45, scale: 1.15 }); addSplash(2.5, -10.2, 1.0, 0.5);
+poseDolphin(-7, -18, { y: -0.33, yaw: -0.9, scale: 1.1 });     addSplash(-7, -17.6, 0.9, 0.45);
+poseDolphin(5.5, -22, { y: -0.32, yaw: 0.1 });                 addSplash(5.5, -21.6, 0.8, 0.4);
+// 只露背鳍划水
+poseDolphin(8.5, -14, { y: -0.62, yaw: 0.3, scale: 1.15 });
+poseDolphin(-4.5, -8.5, { y: -0.60, yaw: -0.25, scale: 1.1 });
+poseDolphin(0.5, -28, { y: -0.55, yaw: 0.0 });                 addSplash(0.5, -27.6, 0.6, 0.35);
+
+// ---------- Jukung 船(翘首 + 双舷外浮架) ----------
+function makeJukung({ hullColor = 0x2b3540, trim = 0xc44b3a, silhouette = false } = {}) {
+  const g = new THREE.Group();
+  const hullMat = new THREE.MeshStandardMaterial({ color: silhouette ? 0x11151a : hullColor, roughness: 0.85 });
+  const trimMat = new THREE.MeshStandardMaterial({ color: silhouette ? 0x11151a : trim, roughness: 0.85 });
+  const bambooMat = new THREE.MeshStandardMaterial({ color: silhouette ? 0x11151a : 0x6f6448, roughness: 0.9 });
+  // 船体
+  const hull = new THREE.Mesh(new THREE.CapsuleGeometry(0.42, 4.6, 4, 10), hullMat);
+  hull.rotation.z = Math.PI/2; hull.scale.y = 0.6;
+  g.add(hull);
+  // 翘起的船艏(曲线管)
+  const prowPts = [new THREE.Vector3(2.4, 0.15, 0), new THREE.Vector3(3.1, 0.55, 0),
+                   new THREE.Vector3(3.5, 1.15, 0), new THREE.Vector3(3.55, 1.7, 0)];
+  const prow = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(prowPts), 12, 0.10, 6), trimMat);
+  g.add(prow);
+  // 船尾小翘
+  const sternPts = [new THREE.Vector3(-2.4, 0.15, 0), new THREE.Vector3(-2.9, 0.5, 0), new THREE.Vector3(-3.05, 0.85, 0)];
+  g.add(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(sternPts), 8, 0.08, 6), trimMat));
+  // 双浮架
+  for (const side of [-1, 1]) {
+    const fl = new THREE.Mesh(new THREE.CapsuleGeometry(0.13, 3.8, 3, 6), bambooMat);
+    fl.rotation.z = Math.PI/2;
+    fl.position.set(0, 0.0, side*2.2);
+    g.add(fl);
+    for (const bx of [-1.3, 1.3]) {
+      const rod = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 2.5), bambooMat);
+      rod.rotation.x = Math.PI/2;
+      rod.position.set(bx, 0.32, side*1.1);
+      rod.rotation.z = side*0.15;
+      g.add(rod);
+    }
+  }
+  // 船上的人(游客 + 船尾船夫)
+  const skin = new THREE.MeshStandardMaterial({ color: silhouette ? 0x0d1014 : 0x2a2f36, roughness: 0.9 });
+  const vest = new THREE.MeshStandardMaterial({ color: silhouette ? 0x151312 : 0xc4622d, roughness: 0.8 });
+  for (const px of [-1.6, -0.6, 0.5]) {
+    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.17, 0.42, 3, 6), vest);
+    body.position.set(px, 0.72, 0); g.add(body);
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.13, 8, 8), skin);
+    head.position.set(px, 1.18, 0); g.add(head);
+  }
+  return g;
+}
+// 围观船队(部分逆光成剪影,部分侧光带色)
+const boats = [
+  { x: -16, z: -26,  ry:  0.35, sil: true  },
+  { x:  14, z: -34,  ry: -0.30, sil: true  },
+  { x: -32, z: -52,  ry:  0.55, sil: true  },
+  { x:  30, z: -60,  ry:  0.15, sil: true  },
+  { x:  46, z: -38,  ry: -0.6,  sil: false },
+  { x: -48, z: -70,  ry:  0.8,  sil: false },
+  { x:   6, z: -85,  ry:  0.0,  sil: true  },
+];
+for (const b of boats) {
+  const bt = makeJukung({ silhouette: b.sil });
+  bt.position.set(b.x, 0.28, b.z);
+  bt.rotation.y = b.ry;
+  scene.add(bt);
+}
+
+// ---------- 自己的船:船头入画(第一人称坐船) ----------
+const myBoat = new THREE.Group();
+const myHullMat = new THREE.MeshStandardMaterial({ color: 0xcfc9b8, roughness: 0.75 });
+const myTrimMat = new THREE.MeshStandardMaterial({ color: 0x5e211a, roughness: 0.8 });
+const myHull = new THREE.Mesh(new THREE.CapsuleGeometry(0.5, 5.0, 4, 12), myHullMat);
+myHull.rotation.z = Math.PI/2; myHull.scale.y = 0.62;
+myBoat.add(myHull);
+const myProwPts = [new THREE.Vector3(2.6, 0.2, 0), new THREE.Vector3(3.4, 0.7, 0),
+                   new THREE.Vector3(3.85, 1.4, 0), new THREE.Vector3(3.9, 2.0, 0)];
+myBoat.add(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(myProwPts), 12, 0.075, 8), myTrimMat));
+// 我们前面坐着的游客(戴橙色救生衣的背影)
+const mate = new THREE.Group();
+const mBody = new THREE.Mesh(new THREE.CapsuleGeometry(0.24, 0.5, 4, 8),
+  new THREE.MeshStandardMaterial({ color: 0xd06a2c, roughness: 0.8 }));
+mBody.position.y = 0.85; mate.add(mBody);
+const mHead = new THREE.Mesh(new THREE.SphereGeometry(0.16, 10, 10),
+  new THREE.MeshStandardMaterial({ color: 0x3a2e26, roughness: 0.9 }));
+mHead.position.y = 1.38; mate.add(mHead);
+mate.position.set(2.3, 0.15, -0.15);
+myBoat.add(mate);
+// 船艏朝向 -Z(视线方向):翘首从画面左下角升起,同船游客背影在左前方
+myBoat.position.set(-1.55, 0.05, 1.6);
+myBoat.rotation.y = Math.PI/2 - 0.02;
+scene.add(myBoat);
+
+// ---------- 远处的巴厘岛山影 ----------
+const hillMat = new THREE.MeshBasicMaterial({ color: 0x232629, fog: true });
+function hill(x, z, w, h) {
+  const m = new THREE.Mesh(new THREE.ConeGeometry(1, 1, 24), hillMat);
+  m.scale.set(w, h, w*0.5);
+  m.position.set(x, h/2 - 6, z);
+  scene.add(m);
+}
+// 远山压低、挪到画面最左缘,只留一抹淡影
+hill(-5200, -5000, 3200, 300);
+hill(-3600, -5400, 2400, 200);
+
+camera.lookAt(-2, 1.6, -60);
+
+renderer.render(scene, camera);
+window.__ready = true;
+</script>
+</body>
+</html>
